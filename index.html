@@ -1,0 +1,190 @@
+<div class="comparison-grid" style="display:grid;grid-template-columns:repeat(2,1fr);gap:20px;"></div>
+
+<script>
+let audioContext;
+let panels = [];
+let panelIdCounter = 0;
+
+document.addEventListener('click',()=>{
+    if(!audioContext) audioContext = new (window.AudioContext||window.webkitAudioContext)();
+},{once:true});
+
+const audioFiles = [
+  {file:'voiceless_alveolar_fricative.mp3', label:'/s/'},
+  {file:'voiced_alveolar_fricative.mp3', label:'/z/'},
+  {file:'voiceless_postalveolar_fricative.mp3', label:'/ʃ/'},
+  {file:'voiced_postalveolar_fricative.mp3', label:'/ʒ/'},
+];
+
+audioFiles.forEach(item=>addPanel(item.file,item.label));
+
+function addPanel(file,label){
+  const grid=document.querySelector('.comparison-grid');
+  const panelId=panelIdCounter++;
+  const panel={id:panelId,label,maxFreq:8000,windowSize:5,viewStart:0,viewEnd:1,waveScale:1.0,audioBuffer:null,isDragging:false};
+  panels.push(panel);
+
+  const panelDiv=document.createElement('div');
+  panelDiv.className='sound-panel';
+  panelDiv.id=`panel-${panelId}`;
+  panelDiv.innerHTML=`
+    <div style="font-weight:bold;">${label}</div>
+    <canvas id="wave-${panelId}" width="300" height="100" style="border:1px solid #ccc;margin-bottom:4px;"></canvas>
+    <canvas id="spec-${panelId}" width="300" height="200" style="border:1px solid #ccc;"></canvas>
+    <div style="margin-top:4px;">
+      Scale: <input type="range" min="1" max="10" step="0.5" value="1" oninput="updateWaveScale(${panelId},this.value)">
+      <span id="scale-val-${panelId}">1x</span>
+      <button onclick="resetZoom(${panelId})">Reset Zoom</button>
+      <button onclick="playZoom(${panelId})">▶ Play Zoom</button>
+    </div>
+    <div style="font-size:11px;color:#666;" id="info-${panelId}">Loading...</div>
+  `;
+  grid.appendChild(panelDiv);
+
+  setupZoomInteraction(panel);
+  if(file) loadAudioFile(panel,file);
+}
+
+// --- Load audio ---
+async function loadAudioFile(panel,file){
+  if(!audioContext) audioContext=new (window.AudioContext||window.webkitAudioContext)();
+  try{
+    const arrayBuffer=await fetch(file).then(r=>r.arrayBuffer());
+    panel.audioBuffer=await audioContext.decodeAudioData(arrayBuffer);
+    document.getElementById(`info-${panel.id}`).textContent=
+      `Duration: ${panel.audioBuffer.duration.toFixed(3)}s | SR: ${panel.audioBuffer.sampleRate} Hz`;
+    renderPanel(panel);
+  }catch(e){
+    document.getElementById(`info-${panel.id}`).textContent=`Error loading file: ${e.message}`;
+  }
+}
+
+// --- Rendering ---
+function renderPanel(panel){
+  if(!panel.audioBuffer) return;
+  drawWaveform(document.getElementById(`wave-${panel.id}`),panel.audioBuffer,panel.viewStart,panel.viewEnd,panel.waveScale);
+  drawSpectrogram(document.getElementById(`spec-${panel.id}`),panel.audioBuffer,panel.maxFreq,panel.windowSize,panel.viewStart,panel.viewEnd);
+}
+
+function updateWaveScale(panelId,value){
+  const panel=panels.find(p=>p.id===panelId);
+  if(!panel||!panel.audioBuffer) return;
+  panel.waveScale=parseFloat(value);
+  document.getElementById(`scale-val-${panelId}`).textContent=value+'x';
+  renderPanel(panel);
+}
+
+function resetZoom(panelId){
+  const panel=panels.find(p=>p.id===panelId);
+  if(!panel||!panel.audioBuffer) return;
+  panel.viewStart=0; panel.viewEnd=1;
+  renderPanel(panel);
+}
+
+function playZoom(panelId){
+  const panel=panels.find(p=>p.id===panelId);
+  if(!panel||!panel.audioBuffer) return;
+  if(panel.sourceNode) panel.sourceNode.stop();
+  panel.sourceNode=audioContext.createBufferSource();
+  panel.sourceNode.buffer=panel.audioBuffer;
+  panel.sourceNode.connect(audioContext.destination);
+  const offset=panel.viewStart*panel.audioBuffer.duration;
+  const duration=(panel.viewEnd-panel.viewStart)*panel.audioBuffer.duration;
+  panel.sourceNode.start(0,offset,duration);
+}
+
+// --- Waveform ---
+function drawWaveform(canvas,audioBuffer,viewStart,viewEnd,scale){
+  const ctx=canvas.getContext('2d'),width=canvas.width,height=canvas.height,data=audioBuffer.getChannelData(0);
+  const startSample=Math.floor(viewStart*data.length),endSample=Math.floor(viewEnd*data.length);
+  ctx.fillStyle='#fff';ctx.fillRect(0,0,width,height);
+  ctx.strokeStyle='#000080';ctx.lineWidth=0.5;ctx.beginPath();
+  for(let x=0;x<width;x++){
+    const idx=Math.floor(startSample+(x/width)*(endSample-startSample));
+    if(idx>=data.length) continue;
+    const y=height/2 - data[idx]*height*0.45*scale;
+    if(x===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.stroke();
+  ctx.strokeStyle='#c0c0c0';ctx.beginPath(); ctx.moveTo(0,height/2); ctx.lineTo(width,height/2); ctx.stroke();
+}
+
+// --- Spectrogram ---
+function drawSpectrogram(canvas,audioBuffer,maxFreq,windowLengthMs,viewStart,viewEnd){
+  const ctx=canvas.getContext('2d'),width=canvas.width,height=canvas.height,data=audioBuffer.getChannelData(0),sr=audioBuffer.sampleRate;
+  const startSample=Math.floor(viewStart*data.length),endSample=Math.floor(viewEnd*data.length);
+  const fftSize=Math.pow(2,Math.ceil(Math.log2(windowLengthMs*sr/1000))),hopSize=Math.floor(fftSize/8);
+  const nyquist=sr/2,displayMaxFreq=Math.min(maxFreq,nyquist);
+  ctx.fillStyle='#fff';ctx.fillRect(0,0,width,height);
+  const numFrames=Math.floor((endSample-startSample-fftSize)/hopSize); if(numFrames<=0) return;
+  const imageData=ctx.createImageData(width,height);
+  const spectralFrames=[];
+  for(let i=0;i<numFrames;i++){
+    const frameStart=startSample+i*hopSize; if(frameStart+fftSize>data.length) break;
+    const frame=new Array(fftSize);for(let j=0;j<fftSize;j++) frame[j]=data[frameStart+j]*(0.54-0.46*Math.cos(2*Math.PI*j/(fftSize-1)));
+    spectralFrames.push(computeFFT(frame));
+  }
+  let gMax=-Infinity,gMin=Infinity;
+  spectralFrames.forEach(s=>s.forEach(m=>{if(m>0){const db=20*Math.log10(m);gMax=Math.max(gMax,db);gMin=Math.min(gMin,db);}}));
+  const dynamicRange=70,maxDb=gMax,minDb=maxDb-dynamicRange;
+  for(let x=0;x<width;x++){
+    const framePos=(x/width)*spectralFrames.length,frameIndex=Math.floor(framePos),frameFrac=framePos-frameIndex;
+    const s1=spectralFrames[frameIndex],s2=frameIndex+1<spectralFrames.length?spectralFrames[frameIndex+1]:s1;
+    const freqBinMax=Math.floor((displayMaxFreq/nyquist)*s1.length);
+    for(let y=0;y<height;y++){
+      const freq=(1-y/height)*displayMaxFreq;
+      const binPos=(freq/nyquist)*s1.length,bin=Math.floor(binPos),binFrac=binPos-bin;
+      if(bin>=freqBinMax||bin>=s1.length){const idx=(y*width+x)*4;imageData.data[idx]=255;imageData.data[idx+1]=255;imageData.data[idx+2]=255;imageData.data[idx+3]=255;continue;}
+      const mag=(s1[bin]*(1-binFrac)+(bin+1<s1.length?s1[bin+1]:s1[bin])*binFrac)*(1-frameFrac)+(s2[bin]*(1-binFrac)+(bin+1<s2.length?s2[bin+1]:s2[bin])*binFrac)*frameFrac;
+      let intensity=0;if(mag>0){const db=20*Math.log10(mag);intensity=(db-minDb)/dynamicRange;intensity=Math.max(0,Math.min(1,intensity));}
+      const color=Math.floor(255*(1-intensity)),idx=(y*width+x)*4;
+      imageData.data[idx]=color;imageData.data[idx+1]=color;imageData.data[idx+2]=color;imageData.data[idx+3]=255;
+    }
+  }
+  ctx.putImageData(imageData,0,0);
+  ctx.fillStyle='#000';ctx.font='10px sans-serif';ctx.textAlign='right';
+  for(let f=0;f<=displayMaxFreq;f+=1000){const y=height*(1-f/displayMaxFreq);ctx.fillText(f+' Hz',width-2,y);}
+}
+
+// --- FFT ---
+function fft(samples){const n=samples.length;if(n<=1)return samples.map(x=>({re:x,im:0}));if(n&(n-1))throw new Error('FFT size must be power of 2');const even=new Array(n/2),odd=new Array(n/2);for(let i=0;i<n/2;i++){even[i]=samples[i*2];odd[i]=samples[i*2+1];}const e=fft(even),o=fft(odd),res=new Array(n);for(let k=0;k<n/2;k++){const a=-2*Math.PI*k/n,cos=Math.cos(a),sin=Math.sin(a),tRe=cos*o[k].re-sin*o[k].im,tIm=cos*o[k].im+sin*o[k].re;res[k]={re:e[k].re+tRe,im:e[k].im+tIm};res[k+n/2]={re:e[k].re-tRe,im:e[k].im-tIm};}return res;}
+function computeFFT(samples){const f=fft(samples),n=samples.length,mags=new Array(n/2);for(let i=0;i<n/2;i++)mags[i]=Math.sqrt(f[i].re*f[i].re+f[i].im*f[i].im)/n;return mags;}
+
+// --- Zoom interaction ---
+function setupZoomInteraction(panel){
+  const wave=document.getElementById(`wave-${panel.id}`);
+  const spec=document.getElementById(`spec-${panel.id}`);
+  [wave,spec].forEach(canvas=>{
+    canvas.addEventListener('mousedown',e=>{
+      panel.isDragging=true;
+      const rect=canvas.getBoundingClientRect();
+      panel.dragStart=(e.clientX-rect.left)/canvas.width;
+    });
+    canvas.addEventListener('mousemove',e=>{
+      if(!panel.isDragging) return;
+      const rect=canvas.getBoundingClientRect();
+      const dragEnd=(e.clientX-rect.left)/canvas.width;
+      const ctx=canvas.getContext('2d');
+      renderPanel(panel);
+      ctx.fillStyle='rgba(255,200,0,0.3)';
+      const x1=Math.min(panel.dragStart,dragEnd)*canvas.width;
+      const x2=Math.max(panel.dragStart,dragEnd)*canvas.width;
+      ctx.fillRect(x1,0,x2-x1,canvas.height);
+    });
+    canvas.addEventListener('mouseup',e=>{
+      if(!panel.isDragging) return;
+      const rect=canvas.getBoundingClientRect();
+      const dragEnd=(e.clientX-rect.left)/canvas.width;
+      if(Math.abs(dragEnd-panel.dragStart)>0.02){
+        const newStart=panel.viewStart+Math.min(panel.dragStart,dragEnd)*(panel.viewEnd-panel.viewStart);
+        const newEnd=panel.viewStart+Math.max(panel.dragStart,dragEnd)*(panel.viewEnd-panel.viewStart);
+        panel.viewStart=newStart;
+        panel.viewEnd=newEnd;
+        renderPanel(panel);
+      }
+      panel.isDragging=false;
+    });
+    canvas.addEventListener('mouseleave',()=>{panel.isDragging=false;});
+  });
+}
+</script>
